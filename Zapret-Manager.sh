@@ -47,8 +47,8 @@ CONF="/etc/config/zapret"
 CUSTOM_DIR="/opt/zapret/init.d/openwrt/custom.d/"
 HOSTLIST_FILE="/opt/zapret/ipset/zapret-hosts-user.txt"
 
-STR_URL="https://raw.githubusercontent.com/StressOzz/Zapret-Manager/refs/heads/main/ListStrYou"
-EXCLUDE_URL="https://raw.githubusercontent.com/StressOzz/Zapret-Manager/refs/heads/main/zapret-hosts-user-exclude.txt"
+STR_URL="https://raw.githubusercontent.com/arsutov/aboba/refs/heads/main/ListStrYou"
+EXCLUDE_URL="https://raw.githubusercontent.com/arsutov/aboba/refs/heads/main/zapret-hosts-user-exclude.txt"
 EXCLUDE_FILE="/opt/zapret/ipset/zapret-hosts-user-exclude.txt"
 
 # ==========================================
