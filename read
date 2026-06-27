@@ -1,0 +1,284 @@
+// ==UserScript==
+// @name         Auto-Refresh + finish_videos guard + alarm
+// @namespace    https://local.tools/autorefresh-finishguard
+// @version      1.0.0
+// @description  Обновляет страницу раз в минуту; ловит редирект на */finish_videos и возвращает обратно; кнопка ВКЛ/ВЫКЛ справа сверху; если редиректа за минуту не было — бесконечный звуковой сигнал до выключения.
+// @match        *://*/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-start
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* =================== НАСТРОЙКИ =================== */
+  const FINISH_MARK       = '/finish_videos'; // признак "редиректа на finish"
+  const CYCLE_MS          = 60 * 1000;        // период / дедлайн редиректа (1 минута)
+  const MIN_RELOAD_GAP_MS = 3000;             // минимум между перезагрузками (защита от петли)
+  const BEEP_EVERY_MS     = 600;              // период повтора звукового сигнала
+
+  /* ключи хранилища */
+  const K_ENABLED   = 'arfg_enabled';
+  const K_LAST_MAIN = 'arfg_last_main_url';
+  const K_LAST_TIME = 'arfg_last_main_time';
+
+  /* =================== ХРАНИЛИЩЕ (GM + фолбэк на localStorage) =================== */
+  const store = {
+    get(k, d) {
+      try { return GM_getValue(k, d); }
+      catch (e) {
+        const v = localStorage.getItem(k);
+        return v === null ? d : JSON.parse(v);
+      }
+    },
+    set(k, v) {
+      try { GM_setValue(k, v); }
+      catch (e) { localStorage.setItem(k, JSON.stringify(v)); }
+    },
+  };
+
+  const isEnabled    = () => store.get(K_ENABLED, false) === true;
+  const setEnabled   = (v) => store.set(K_ENABLED, v === true);
+  const isFinishPage = () => location.href.indexOf(FINISH_MARK) !== -1;
+
+  const loadTime = Date.now();
+  let reloadScheduled = false;
+  let alarmTimer = null;
+  let alarming = false;
+
+  /* =================== ЗВУК =================== */
+  let audioCtx = null;
+  let beepTimer = null;
+
+  function getCtx() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    return audioCtx;
+  }
+  function beep() {
+    const ctx = getCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'square';
+    o.frequency.setValueAtTime(880, t);
+    o.frequency.setValueAtTime(660, t + 0.15);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.30);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(t); o.stop(t + 0.32);
+  }
+  function startSound() {
+    if (beepTimer) return;
+    beep();
+    beepTimer = setInterval(beep, BEEP_EVERY_MS);
+  }
+  function stopSound() {
+    if (beepTimer) { clearInterval(beepTimer); beepTimer = null; }
+  }
+  // Браузеры блокируют звук без жеста пользователя (а после авто-перезагрузки жеста нет).
+  // Поэтому разблокируем аудио при первом любом взаимодействии со страницей.
+  function unlockAudio() {
+    const c = getCtx();
+    if (c && c.state === 'suspended') c.resume().catch(() => {});
+  }
+  ['pointerdown', 'keydown', 'click', 'touchstart'].forEach((ev) =>
+    window.addEventListener(ev, unlockAudio, { capture: true })
+  );
+
+  /* =================== ВИЗУАЛЬНАЯ ТРЕВОГА (на случай блокировки звука) =================== */
+  let titleFlip = null;
+  let savedTitle = null;
+  function startVisualAlarm(btn) {
+    if (titleFlip) return;
+    savedTitle = document.title;
+    let on = false;
+    titleFlip = setInterval(() => {
+      on = !on;
+      document.title = on ? '🔔 НЕТ РЕДИРЕКТА!' : savedTitle;
+      if (btn) btn.style.boxShadow = on ? '0 0 0 4px rgba(255,0,0,.7)' : 'none';
+    }, 500);
+  }
+  function stopVisualAlarm(btn) {
+    if (titleFlip) { clearInterval(titleFlip); titleFlip = null; }
+    if (savedTitle != null) document.title = savedTitle;
+    if (btn) btn.style.boxShadow = 'none';
+  }
+
+  /* =================== ПЕРЕЗАГРУЗКА С ЗАЩИТОЙ ОТ ПЕТЛИ =================== */
+  function scheduleReload() {
+    if (reloadScheduled) return;
+    reloadScheduled = true;
+    const elapsed = Date.now() - loadTime;
+    const delay = Math.max(0, MIN_RELOAD_GAP_MS - elapsed);
+    setTimeout(() => location.reload(), delay);
+  }
+
+  /* =================== ЛОВЛЯ РЕДИРЕКТА НА FINISH (на исходной странице) ===================
+     Программный редирект (location.href = '.../finish_videos') в большинстве браузеров
+     перехватить/отменить нельзя — поэтому основная защита это "возврат" уже со страницы
+     finish_videos (см. bounceFromFinish). Здесь же ловим то, что поймать реально:
+     клики по ссылкам и meta-refresh. */
+  function installSourceGuards() {
+    // 1) клики по ссылкам, ведущим на finish
+    window.addEventListener('click', (e) => {
+      if (!isEnabled()) return;
+      const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+      if (a && a.href && a.href.indexOf(FINISH_MARK) !== -1) {
+        e.preventDefault();
+        e.stopPropagation();
+        scheduleReload();
+      }
+    }, true);
+
+    // 2) <meta http-equiv="refresh" ... finish> — удаляем и перезагружаем сами
+    const killMeta = () => {
+      if (!isEnabled()) return;
+      document.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => {
+        const c = (m.getAttribute('content') || '').toLowerCase();
+        if (c.indexOf(FINISH_MARK) !== -1) {
+          if (m.parentNode) m.parentNode.removeChild(m);
+          scheduleReload();
+        }
+      });
+    };
+    killMeta();
+    try {
+      new MutationObserver(killMeta).observe(document.documentElement, {
+        childList: true, subtree: true,
+      });
+    } catch (e) {}
+  }
+
+  /* =================== ОТМЕНА РЕДИРЕКТА: ВОЗВРАТ СО СТРАНИЦЫ FINISH =================== */
+  function bounceFromFinish() {
+    const t0 = store.get(K_LAST_TIME, 0);
+    const elapsed = Date.now() - t0;
+    const delay = Math.max(0, MIN_RELOAD_GAP_MS - elapsed); // не зацикливаться слишком быстро
+    setTimeout(() => {
+      const back = store.get(K_LAST_MAIN, '');
+      if (back && back.indexOf(FINISH_MARK) === -1) {
+        location.replace(back);        // вернуться на исходную страницу и обновить её
+      } else if (history.length > 1) {
+        history.back();
+      } else {
+        location.replace('/');
+      }
+    }, delay);
+  }
+
+  /* =================== ТРЕВОГА (за минуту редиректа не было) =================== */
+  function triggerAlarm(btn) {
+    if (alarming) return;
+    alarming = true;
+    startSound();
+    startVisualAlarm(btn);
+    if (btn) updateButton(btn);
+  }
+  function stopAlarm(btn) {
+    alarming = false;
+    stopSound();
+    stopVisualAlarm(btn);
+  }
+
+  /* =================== ЦИКЛ НА ОСНОВНОЙ СТРАНИЦЕ =================== */
+  function startCycle(btn) {
+    if (alarmTimer) clearTimeout(alarmTimer);
+    // Если за минуту страница не уйдёт в редирект (а значит и не перезагрузится),
+    // значит редиректа не было -> включаем тревогу.
+    alarmTimer = setTimeout(() => triggerAlarm(btn), CYCLE_MS);
+  }
+  function stopCycle() {
+    if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; }
+  }
+
+  /* =================== КНОПКА =================== */
+  function updateButton(btn) {
+    if (alarming) {
+      btn.textContent = '🔔 СТОП';
+      btn.style.background = '#d32f2f';
+      return;
+    }
+    const on = isEnabled();
+    btn.textContent = on ? '⟳ ВКЛ' : '⏻ ВЫКЛ';
+    btn.style.background = on ? '#2e7d32' : '#555';
+  }
+  function buildButton() {
+    let btn = document.getElementById('arfg-btn');
+    if (btn) return btn;
+    btn = document.createElement('button');
+    btn.id = 'arfg-btn';
+    Object.assign(btn.style, {
+      position: 'fixed', top: '10px', right: '10px', zIndex: '2147483647',
+      padding: '8px 12px', font: '600 13px/1 system-ui, sans-serif',
+      color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer',
+      boxShadow: 'none', opacity: '0.92', userSelect: 'none',
+    });
+    btn.addEventListener('click', () => onToggle(btn));
+    (document.body || document.documentElement).appendChild(btn);
+    updateButton(btn);
+    return btn;
+  }
+  function onToggle(btn) {
+    // Во время тревоги нажатие = выключить (и звук, и скрипт).
+    if (alarming) {
+      stopAlarm(btn);
+      setEnabled(false);
+      stopCycle();
+      updateButton(btn);
+      return;
+    }
+    const next = !isEnabled();
+    setEnabled(next);
+    if (next) {
+      // Включаем по жесту пользователя -> сразу создаём/разблокируем аудио и
+      // перезапускаем страницу для чистого старта цикла.
+      getCtx();
+      unlockAudio();
+      location.reload();
+    } else {
+      stopCycle();
+      stopAlarm(btn);
+      updateButton(btn);
+    }
+  }
+
+  /* =================== СТАРТ =================== */
+
+  // На странице finish: если включено — сразу возвращаемся (это и есть "отмена редиректа").
+  if (isEnabled() && isFinishPage()) {
+    bounceFromFinish();
+    return;
+  }
+
+  // На обычной странице запоминаем её как точку возврата как можно раньше
+  // (до того как сайт успеет уйти в редирект).
+  if (isEnabled() && !isFinishPage()) {
+    store.set(K_LAST_MAIN, location.href);
+    store.set(K_LAST_TIME, Date.now());
+  }
+
+  installSourceGuards();
+
+  function onReady(fn) {
+    if (document.body) { fn(); return; }
+    document.addEventListener('DOMContentLoaded', fn, { once: true });
+    const iv = setInterval(() => {
+      if (document.body) { clearInterval(iv); fn(); }
+    }, 50);
+  }
+
+  onReady(() => {
+    if (isFinishPage()) return;          // на finish кнопку не рисуем
+    const btn = buildButton();
+    if (isEnabled()) startCycle(btn);
+    updateButton(btn);
+  });
+})();
