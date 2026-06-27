@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Auto-Refresh + finish_videos guard + alarm
 // @namespace    https://local.tools/autorefresh-finishguard
-// @version      1.0.0
-// @description  Обновляет страницу раз в минуту; ловит редирект на */finish_videos и возвращает обратно; кнопка ВКЛ/ВЫКЛ справа сверху; если редиректа за минуту не было — бесконечный звуковой сигнал до выключения.
+// @version      1.1.0
+// @description  Обновляет страницу раз в минуту; ловит редирект на */finish_videos и возвращает обратно; кнопка ВКЛ/ВЫКЛ справа сверху (и в меню Tampermonkey); если редиректа за минуту не было — бесконечный звук до выключения.
 // @match        *://*/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_registerMenuCommand
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
@@ -18,24 +19,23 @@
   const CYCLE_MS          = 60 * 1000;        // период / дедлайн редиректа (1 минута)
   const MIN_RELOAD_GAP_MS = 3000;             // минимум между перезагрузками (защита от петли)
   const BEEP_EVERY_MS     = 600;              // период повтора звукового сигнала
+  const LOG = (...a) => { try { console.log('[ARFG]', ...a); } catch (e) {} };
 
   /* ключи хранилища */
   const K_ENABLED   = 'arfg_enabled';
   const K_LAST_MAIN = 'arfg_last_main_url';
   const K_LAST_TIME = 'arfg_last_main_time';
 
-  /* =================== ХРАНИЛИЩЕ (GM + фолбэк на localStorage) =================== */
+  /* =================== ХРАНИЛИЩЕ (GM + фолбэк, никогда не бросает) =================== */
   const store = {
     get(k, d) {
-      try { return GM_getValue(k, d); }
-      catch (e) {
-        const v = localStorage.getItem(k);
-        return v === null ? d : JSON.parse(v);
-      }
+      try { const v = GM_getValue(k, undefined); if (v !== undefined) return v; } catch (e) {}
+      try { const v = localStorage.getItem(k); if (v !== null) return JSON.parse(v); } catch (e) {}
+      return d;
     },
     set(k, v) {
-      try { GM_setValue(k, v); }
-      catch (e) { localStorage.setItem(k, JSON.stringify(v)); }
+      try { GM_setValue(k, v); } catch (e) {}
+      try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {}
     },
   };
 
@@ -48,24 +48,19 @@
   let alarmTimer = null;
   let alarming = false;
 
-  /* =================== ЗВУК =================== */
-  let audioCtx = null;
-  let beepTimer = null;
+  LOG('loaded. url=', location.href, '| enabled=', isEnabled(), '| finishPage=', isFinishPage());
 
+  /* =================== ЗВУК =================== */
+  let audioCtx = null, beepTimer = null;
   function getCtx() {
-    if (!audioCtx) {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (AC) audioCtx = new AC();
-    }
+    if (!audioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) audioCtx = new AC(); }
     return audioCtx;
   }
   function beep() {
-    const ctx = getCtx();
-    if (!ctx) return;
+    const ctx = getCtx(); if (!ctx) return;
     if (ctx.state === 'suspended') ctx.resume().catch(() => {});
     const t = ctx.currentTime;
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
+    const o = ctx.createOscillator(), g = ctx.createGain();
     o.type = 'square';
     o.frequency.setValueAtTime(880, t);
     o.frequency.setValueAtTime(660, t + 0.15);
@@ -75,145 +70,107 @@
     o.connect(g); g.connect(ctx.destination);
     o.start(t); o.stop(t + 0.32);
   }
-  function startSound() {
-    if (beepTimer) return;
-    beep();
-    beepTimer = setInterval(beep, BEEP_EVERY_MS);
-  }
-  function stopSound() {
-    if (beepTimer) { clearInterval(beepTimer); beepTimer = null; }
-  }
-  // Браузеры блокируют звук без жеста пользователя (а после авто-перезагрузки жеста нет).
-  // Поэтому разблокируем аудио при первом любом взаимодействии со страницей.
-  function unlockAudio() {
-    const c = getCtx();
-    if (c && c.state === 'suspended') c.resume().catch(() => {});
-  }
+  function startSound() { if (beepTimer) return; beep(); beepTimer = setInterval(beep, BEEP_EVERY_MS); }
+  function stopSound()  { if (beepTimer) { clearInterval(beepTimer); beepTimer = null; } }
+  function unlockAudio(){ const c = getCtx(); if (c && c.state === 'suspended') c.resume().catch(() => {}); }
   ['pointerdown', 'keydown', 'click', 'touchstart'].forEach((ev) =>
-    window.addEventListener(ev, unlockAudio, { capture: true })
-  );
+    window.addEventListener(ev, unlockAudio, { capture: true }));
 
   /* =================== ВИЗУАЛЬНАЯ ТРЕВОГА (на случай блокировки звука) =================== */
-  let titleFlip = null;
-  let savedTitle = null;
-  function startVisualAlarm(btn) {
+  let titleFlip = null, savedTitle = null;
+  function startVisualAlarm() {
     if (titleFlip) return;
-    savedTitle = document.title;
-    let on = false;
+    savedTitle = document.title; let on = false;
     titleFlip = setInterval(() => {
       on = !on;
       document.title = on ? '🔔 НЕТ РЕДИРЕКТА!' : savedTitle;
-      if (btn) btn.style.boxShadow = on ? '0 0 0 4px rgba(255,0,0,.7)' : 'none';
+      const b = document.getElementById('arfg-btn');
+      if (b) b.style.boxShadow = on ? '0 0 0 4px rgba(255,0,0,.7)' : 'none';
     }, 500);
   }
-  function stopVisualAlarm(btn) {
+  function stopVisualAlarm() {
     if (titleFlip) { clearInterval(titleFlip); titleFlip = null; }
     if (savedTitle != null) document.title = savedTitle;
-    if (btn) btn.style.boxShadow = 'none';
+    const b = document.getElementById('arfg-btn'); if (b) b.style.boxShadow = 'none';
   }
 
   /* =================== ПЕРЕЗАГРУЗКА С ЗАЩИТОЙ ОТ ПЕТЛИ =================== */
   function scheduleReload() {
     if (reloadScheduled) return;
     reloadScheduled = true;
-    const elapsed = Date.now() - loadTime;
-    const delay = Math.max(0, MIN_RELOAD_GAP_MS - elapsed);
+    const delay = Math.max(0, MIN_RELOAD_GAP_MS - (Date.now() - loadTime));
+    LOG('reload in', delay, 'ms');
     setTimeout(() => location.reload(), delay);
   }
 
-  /* =================== ЛОВЛЯ РЕДИРЕКТА НА FINISH (на исходной странице) ===================
-     Программный редирект (location.href = '.../finish_videos') в большинстве браузеров
-     перехватить/отменить нельзя — поэтому основная защита это "возврат" уже со страницы
-     finish_videos (см. bounceFromFinish). Здесь же ловим то, что поймать реально:
-     клики по ссылкам и meta-refresh. */
+  /* =================== ЛОВЛЯ РЕДИРЕКТА НА ИСХОДНОЙ СТРАНИЦЕ =================== */
   function installSourceGuards() {
-    // 1) клики по ссылкам, ведущим на finish
     window.addEventListener('click', (e) => {
       if (!isEnabled()) return;
       const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (a && a.href && a.href.indexOf(FINISH_MARK) !== -1) {
-        e.preventDefault();
-        e.stopPropagation();
-        scheduleReload();
+        e.preventDefault(); e.stopPropagation();
+        LOG('caught link -> finish'); scheduleReload();
       }
     }, true);
 
-    // 2) <meta http-equiv="refresh" ... finish> — удаляем и перезагружаем сами
     const killMeta = () => {
       if (!isEnabled()) return;
       document.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => {
         const c = (m.getAttribute('content') || '').toLowerCase();
         if (c.indexOf(FINISH_MARK) !== -1) {
           if (m.parentNode) m.parentNode.removeChild(m);
-          scheduleReload();
+          LOG('caught meta-refresh -> finish'); scheduleReload();
         }
       });
     };
     killMeta();
-    try {
-      new MutationObserver(killMeta).observe(document.documentElement, {
-        childList: true, subtree: true,
-      });
-    } catch (e) {}
+    try { new MutationObserver(killMeta).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
   }
 
   /* =================== ОТМЕНА РЕДИРЕКТА: ВОЗВРАТ СО СТРАНИЦЫ FINISH =================== */
   function bounceFromFinish() {
-    const t0 = store.get(K_LAST_TIME, 0);
-    const elapsed = Date.now() - t0;
-    const delay = Math.max(0, MIN_RELOAD_GAP_MS - elapsed); // не зацикливаться слишком быстро
+    const elapsed = Date.now() - store.get(K_LAST_TIME, 0);
+    const delay = Math.max(0, MIN_RELOAD_GAP_MS - elapsed);
+    LOG('on finish page -> bounce back in', delay, 'ms');
     setTimeout(() => {
       const back = store.get(K_LAST_MAIN, '');
-      if (back && back.indexOf(FINISH_MARK) === -1) {
-        location.replace(back);        // вернуться на исходную страницу и обновить её
-      } else if (history.length > 1) {
-        history.back();
-      } else {
-        location.replace('/');
-      }
+      if (back && back.indexOf(FINISH_MARK) === -1) location.replace(back);
+      else if (history.length > 1) history.back();
+      else location.replace('/');
     }, delay);
   }
 
-  /* =================== ТРЕВОГА (за минуту редиректа не было) =================== */
-  function triggerAlarm(btn) {
+  /* =================== ТРЕВОГА =================== */
+  function triggerAlarm() {
     if (alarming) return;
     alarming = true;
-    startSound();
-    startVisualAlarm(btn);
-    if (btn) updateButton(btn);
+    LOG('NO REDIRECT in', CYCLE_MS, 'ms -> ALARM');
+    startSound(); startVisualAlarm(); refreshButton();
   }
-  function stopAlarm(btn) {
-    alarming = false;
-    stopSound();
-    stopVisualAlarm(btn);
-  }
+  function stopAlarm() { alarming = false; stopSound(); stopVisualAlarm(); }
 
-  /* =================== ЦИКЛ НА ОСНОВНОЙ СТРАНИЦЕ =================== */
-  function startCycle(btn) {
+  /* =================== ЦИКЛ =================== */
+  function startCycle() {
     if (alarmTimer) clearTimeout(alarmTimer);
-    // Если за минуту страница не уйдёт в редирект (а значит и не перезагрузится),
-    // значит редиректа не было -> включаем тревогу.
-    alarmTimer = setTimeout(() => triggerAlarm(btn), CYCLE_MS);
+    alarmTimer = setTimeout(triggerAlarm, CYCLE_MS);
+    LOG('cycle armed: alarm in', CYCLE_MS, 'ms if no redirect');
   }
-  function stopCycle() {
-    if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; }
-  }
+  function stopCycle() { if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; } }
 
-  /* =================== КНОПКА =================== */
-  function updateButton(btn) {
-    if (alarming) {
-      btn.textContent = '🔔 СТОП';
-      btn.style.background = '#d32f2f';
-      return;
-    }
-    const on = isEnabled();
-    btn.textContent = on ? '⟳ ВКЛ' : '⏻ ВЫКЛ';
-    btn.style.background = on ? '#2e7d32' : '#555';
+  /* =================== КНОПКА (самовосстанавливающаяся) =================== */
+  function refreshButton() {
+    const btn = document.getElementById('arfg-btn');
+    if (!btn) return;
+    if (alarming)          { btn.textContent = '🔔 ОСТАНОВИТЬ'; btn.style.background = '#d32f2f'; }
+    else if (isEnabled())  { btn.textContent = '● Работает (стоп)'; btn.style.background = '#2e7d32'; }
+    else                   { btn.textContent = '▶ Запустить'; btn.style.background = '#555'; }
   }
-  function buildButton() {
-    let btn = document.getElementById('arfg-btn');
-    if (btn) return btn;
-    btn = document.createElement('button');
+  function ensureButton() {
+    if (document.getElementById('arfg-btn')) return;
+    const root = document.body || document.documentElement;
+    if (!root) return;
+    const btn = document.createElement('button');
     btn.id = 'arfg-btn';
     Object.assign(btn.style, {
       position: 'fixed', top: '10px', right: '10px', zIndex: '2147483647',
@@ -221,64 +178,47 @@
       color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer',
       boxShadow: 'none', opacity: '0.92', userSelect: 'none',
     });
-    btn.addEventListener('click', () => onToggle(btn));
-    (document.body || document.documentElement).appendChild(btn);
-    updateButton(btn);
-    return btn;
+    btn.addEventListener('click', (e) => { e.stopPropagation(); onToggle(); });
+    root.appendChild(btn);
+    refreshButton();
+    LOG('button placed');
   }
-  function onToggle(btn) {
-    // Во время тревоги нажатие = выключить (и звук, и скрипт).
-    if (alarming) {
-      stopAlarm(btn);
-      setEnabled(false);
-      stopCycle();
-      updateButton(btn);
-      return;
-    }
+  // держим кнопку живой даже на SPA / при перерисовке DOM
+  setInterval(ensureButton, 1500);
+
+  function onToggle() {
+    if (alarming) { stopAlarm(); setEnabled(false); stopCycle(); refreshButton(); LOG('alarm stopped + disabled'); return; }
     const next = !isEnabled();
     setEnabled(next);
-    if (next) {
-      // Включаем по жесту пользователя -> сразу создаём/разблокируем аудио и
-      // перезапускаем страницу для чистого старта цикла.
-      getCtx();
-      unlockAudio();
-      location.reload();
-    } else {
-      stopCycle();
-      stopAlarm(btn);
-      updateButton(btn);
-    }
+    LOG('toggle ->', next ? 'ON' : 'OFF');
+    if (next) { getCtx(); unlockAudio(); location.reload(); }
+    else { stopCycle(); stopAlarm(); refreshButton(); }
   }
+
+  // дублирующий переключатель в меню Tampermonkey
+  try { GM_registerMenuCommand('▶/■ Вкл-Выкл сторож', onToggle); } catch (e) {}
 
   /* =================== СТАРТ =================== */
+  // На finish-странице: если включено — сразу возвращаемся (это и есть «отмена редиректа»).
+  if (isEnabled() && isFinishPage()) { bounceFromFinish(); return; }
 
-  // На странице finish: если включено — сразу возвращаемся (это и есть "отмена редиректа").
-  if (isEnabled() && isFinishPage()) {
-    bounceFromFinish();
-    return;
-  }
-
-  // На обычной странице запоминаем её как точку возврата как можно раньше
-  // (до того как сайт успеет уйти в редирект).
+  // Запоминаем обычную страницу как точку возврата как можно раньше.
   if (isEnabled() && !isFinishPage()) {
     store.set(K_LAST_MAIN, location.href);
     store.set(K_LAST_TIME, Date.now());
   }
 
   installSourceGuards();
+  ensureButton(); // попытка нарисовать кнопку прямо сейчас (если есть documentElement)
 
   function onReady(fn) {
     if (document.body) { fn(); return; }
     document.addEventListener('DOMContentLoaded', fn, { once: true });
-    const iv = setInterval(() => {
-      if (document.body) { clearInterval(iv); fn(); }
-    }, 50);
+    const iv = setInterval(() => { if (document.body) { clearInterval(iv); fn(); } }, 50);
   }
-
   onReady(() => {
-    if (isFinishPage()) return;          // на finish кнопку не рисуем
-    const btn = buildButton();
-    if (isEnabled()) startCycle(btn);
-    updateButton(btn);
+    ensureButton();
+    if (isEnabled() && !isFinishPage()) startCycle();
+    refreshButton();
   });
 })();
